@@ -195,7 +195,4 @@ Tip: GPU significantly accelerates Whisper and transformer inference.
 
 ---
 
-## 📜 License
-Choose a license and add it here (e.g., MIT, Apache-2.0).
-
 
