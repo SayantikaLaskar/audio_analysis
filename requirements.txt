@@ -1,0 +1,14 @@
+torch>=2.0.0
+torchaudio>=2.0.0
+transformers>=4.38.0
+librosa>=0.10.0
+whisper @ git+https://github.com/openai/whisper.git
+pyannote.audio>=3.3.2
+soundfile>=0.12.1
+numpy>=1.24.0
+scipy>=1.11.0
+tqdm>=4.65.0
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+pymongo>=4.7.2
+python-dotenv>=1.0.1
