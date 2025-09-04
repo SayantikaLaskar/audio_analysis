@@ -99,27 +99,38 @@ python api.py
 
 Endpoints:
 - GET /health → `{ "status": "ok" }`
-- POST /transcribe → multipart file upload or form path input
+- POST /transcribe → JSON body (project_id, task_id, user_id)
+- POST /transcribe-upload → multipart file upload or form path input
 
-Request options for `POST /transcribe` (provide one of):
-- `file`: multipart file upload (e.g., `audio/mpeg`, `audio/wav`)
-- `audio_path`: path to an existing local audio file on the server
+JSON body for `POST /transcribe`:
+```json
+{
+  "project_id": "68aab18274ec11e465e4fb91",
+  "task_id": "68b58059c70e58f9921dbdfb",
+  "user_id": "6857b9446800696c7aa3cdc1"
+}
+```
 
 Examples (PowerShell):
 ```
-curl -Method Post -Uri http://localhost:8000/transcribe -InFile .\sample.mp3 -ContentType 'audio/mpeg'
+curl -Method Post -Uri http://localhost:8000/transcribe -Body '{"project_id":"68aab18274ec11e465e4fb91","task_id":"68b58059c70e58f9921dbdfb","user_id":"6857b9446800696c7aa3cdc1"}' -ContentType 'application/json'
 ```
 
 Using `curl` (Git Bash / Linux / macOS):
 ```
 curl -X POST http://localhost:8000/transcribe \
-  -F "file=@sample.mp3"
+  -H "Content-Type: application/json" \
+  -d '{
+    "project_id": "68aab18274ec11e465e4fb91",
+    "task_id": "68b58059c70e58f9921dbdfb",
+    "user_id": "6857b9446800696c7aa3cdc1"
+  }'
 ```
 
-Using a local path (no upload):
+File upload variant (`POST /transcribe-upload`):
 ```
-curl -X POST http://localhost:8000/transcribe \
-  -F "audio_path=C:\\audio\\sample.mp3"
+curl -X POST http://localhost:8000/transcribe-upload \
+  -F "file=@sample.mp3"
 ```
 
 Response (example):

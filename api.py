@@ -1,9 +1,15 @@
 import os
-import shutil
-import json
+import tempfile
+import requests
+import re
 from typing import Optional
+from pydantic import BaseModel
+try:
+    from bson import ObjectId as BsonObjectId 
+except Exception:
+    BsonObjectId = None
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from pymongo import MongoClient
@@ -13,18 +19,22 @@ app = FastAPI(title="Audio Processing API", version="1.0.0")
 # Load env and setup Mongo
 load_dotenv()
 MONGODB_URI = os.getenv("MONGODB_URI")
-MONGODB_DB = os.getenv("MONGODB_DB", "audio_db")
+MONGODB_DB = os.getenv("MONGODB_DB", "AkaiDb0")  # Updated to match your DB name
 MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "transcriptions")
 mongo_client: Optional[MongoClient] = None
 mongo_collection = None
+audio_datapoints_collection = None
 
 if MONGODB_URI:
     try:
         mongo_client = MongoClient(MONGODB_URI)
         mongo_collection = mongo_client[MONGODB_DB][MONGODB_COLLECTION]
+        # Audio datapoints collection where media URL is stored
+        audio_datapoints_collection = mongo_client[MONGODB_DB]["audioDatapoints"]
     except Exception:
         mongo_client = None
         mongo_collection = None
+        audio_datapoints_collection = None
 
 
 @app.get("/health")
@@ -32,25 +42,26 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
+class TranscribeRequest(BaseModel):
+    project_id: str
+    task_id: str
+    user_id: str
+
+
 @app.post("/transcribe")
-async def transcribe(
-    file: Optional[UploadFile] = File(default=None),
-    audio_path: Optional[str] = Form(default=None),
-):
-    """Transcribe and analyze audio.
+async def transcribe_json(request: TranscribeRequest):
+    """Transcribe and analyze audio using a JSON body.
 
-    One of `file` (multipart upload) or `audio_path` (existing local path) must be provided.
-    Returns merged transcript with speakers, emotions, detected language and sound effects.
+    Body parameters:
+    - project_id: string
+    - task_id: string  
+    - user_id: string
     """
-
-    if not file and not audio_path:
-        raise HTTPException(status_code=400, detail="Provide either file upload or audio_path")
 
     # Lazy import heavy pipeline to avoid import failures when server boots
     try:
         from sed_stt import (
             convert_to_wav,
-            check_file_exists,
             run_sed,
             run_diarization,
             run_stt,
@@ -59,23 +70,119 @@ async def transcribe(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to import pipeline: {e}")
 
-    # Persist upload if provided
-    temp_input_path: Optional[str] = None
-    try:
-        if file:
-            filename = os.path.basename(file.filename) if file.filename else "uploaded_audio"
-            temp_input_path = os.path.abspath(filename)
-            with open(temp_input_path, "wb") as f:
-                shutil.copyfileobj(file.file, f)
-            source_path = temp_input_path
-        else:
-            # Validate local path
-            if not check_file_exists(audio_path):
-                raise HTTPException(status_code=404, detail=f"Audio file not found: {audio_path}")
-            source_path = audio_path
+    # Resolve audio URL from audioDatapoints collection
+    if audio_datapoints_collection is None:
+        raise HTTPException(status_code=500, detail="Audio datapoints collection not available")
 
+    # Build filters that match either string IDs or ObjectId-stored IDs
+    def build_id_candidates(value: str):
+        # Trim whitespace/newlines from incoming IDs
+        cleaned = (value or "").strip()
+        candidates = [cleaned]
+        if BsonObjectId is not None:
+            try:
+                candidates.append(BsonObjectId(cleaned))
+            except Exception:
+                pass
+        return candidates
+
+    try:
+        # Updated query to match your data structure
+        query = {
+            "task_id": {"$in": build_id_candidates(request.task_id)},
+            "project_id": {"$in": build_id_candidates(request.project_id)},
+            "mediaUrl": {"$exists": True}
+        }
+        dp_list = list(audio_datapoints_collection.find(query))
+        
+        # Debug info
+        print(f"Query: {query}")
+        print(f"Task ID candidates: {build_id_candidates(request.task_id)}")
+        print(f"Project ID candidates: {build_id_candidates(request.project_id)}")
+        print(f"Found {len(dp_list)} documents")
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Datapoint query failed: {e}")
+
+    if not dp_list:
+        # Try a broader search for debugging
+        try:
+            task_only = list(audio_datapoints_collection.find({"task_id": {"$in": build_id_candidates(request.task_id)}}).limit(5))
+            project_only = list(audio_datapoints_collection.find({"project_id": {"$in": build_id_candidates(request.project_id)}}).limit(5))
+            print(f"Task-only matches: {len(task_only)}")
+            print(f"Project-only matches: {len(project_only)}")
+        except Exception as e:
+            print(f"Debug query failed: {e}")
+            
+        raise HTTPException(
+            status_code=404, 
+            detail=f"No datapoint found for task_id={request.task_id}, project_id={request.project_id}. Check /debug/audioDatapoints endpoint for available data."
+        )
+
+    # Get the first matching document
+    dp = dp_list[0]
+    audio_url = dp.get("mediaUrl")
+    if not audio_url:
+        raise HTTPException(status_code=404, detail="Datapoint has no media URL field")
+
+    # Download audio to a temporary file (supports public HTTP and private S3 via boto3)
+    temp_file = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".audio") as tf:
+            temp_file = tf.name
+            r = requests.get(audio_url, timeout=30)
+            if r.status_code == 200:
+                tf.write(r.content)
+            else:
+                # Try S3 signed download if URL looks like S3 and boto3 credentials exist
+                is_s3 = bool(re.match(r"^https?://[\w.-]*s3[\w.-]*/", audio_url)) or audio_url.startswith("s3://")
+                if is_s3:
+                    try:
+                        import boto3
+                        from urllib.parse import urlparse
+
+                        def parse_s3(url: str):
+                            if url.startswith("s3://"):
+                                # s3://bucket/key
+                                parts = url[5:].split("/", 1)
+                                return parts[0], parts[1]
+                            # https://bucket.s3.amazonaws.com/key or virtual-hosted-style
+                            parsed = urlparse(url)
+                            host = parsed.netloc
+                            path = parsed.path.lstrip("/")
+                            if ".s3" in host:
+                                bucket = host.split(".s3")[0]
+                            else:
+                                # path-style: s3.amazonaws.com/bucket/key
+                                first, rest = path.split("/", 1)
+                                bucket, path = first, rest
+                            return bucket, path
+
+                        bucket, key = parse_s3(audio_url)
+                        s3 = boto3.client("s3")
+                        s3.download_file(bucket, key, temp_file)
+                    except Exception as e:
+                        raise HTTPException(status_code=502, detail=f"Failed to download audio via S3: {e}")
+                else:
+                    raise HTTPException(status_code=502, detail=f"Failed to download audio (status {r.status_code})")
+    except requests.RequestException as e:
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except Exception:
+                pass
+        raise HTTPException(status_code=502, detail=f"Failed to download audio: {e}")
+    except Exception as e:
+        if temp_file and os.path.exists(temp_file):
+            try:
+                os.remove(temp_file)
+            except Exception:
+                pass
+        raise HTTPException(status_code=502, detail=f"Failed to download audio: {e}")
+
+    try:
         # Convert or use original
-        wav_path = convert_to_wav(source_path)
+        wav_path = convert_to_wav(temp_file)
 
         # Run pipeline
         sed_events = run_sed(wav_path)
@@ -84,8 +191,8 @@ async def transcribe(
 
         # Build output dict (do not write to local file)
         data = build_output(
-            source_path,
-            source_path,
+            str(dp.get("_id")) if dp.get("_id") else "datapoint",
+            audio_url,
             sed_events,
             diarization,
             transcript,
@@ -93,14 +200,12 @@ async def transcribe(
             save_to_file=False,
         )
 
-        # Persist to MongoDB if configured
-        if mongo_collection is not None:
-            try:
-                insert_result = mongo_collection.insert_one(data)
-                data["_id"] = str(insert_result.inserted_id)
-            except Exception as e:
-                # Do not fail the request if DB insert fails; include warning
-                data["db_error"] = str(e)
+        # Attach IDs
+        data["project_id"] = request.project_id
+        data["task_id"] = request.task_id
+        data["user_id"] = request.user_id
+        data["datapoint_id"] = str(dp.get("_id")) if dp.get("_id") else None
+        data["audio_url"] = audio_url
 
         return JSONResponse(content=data)
 
@@ -109,16 +214,60 @@ async def transcribe(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Cleanup temporary upload if created
-        if temp_input_path and os.path.exists(temp_input_path):
+        # Cleanup temporary file
+        try:
+            if temp_file and os.path.exists(temp_file):
+                os.remove(temp_file)
+            # Also cleanup wav file if it's different from temp_file
+            if 'wav_path' in locals() and wav_path != temp_file and os.path.exists(wav_path):
+                os.remove(wav_path)
+        except Exception:
+            pass
+
+
+@app.get("/debug/audioDatapoints")
+async def debug_audio_datapoints(project_id: str, task_id: str):
+    """Debug helper: check visibility of datapoints by IDs and collection/DB wiring."""
+    if audio_datapoints_collection is None:
+        raise HTTPException(status_code=500, detail="Audio datapoints collection not available")
+
+    def build_id_candidates_local(value: str):
+        cleaned = (value or "").strip()
+        candidates = [cleaned]
+        if BsonObjectId is not None:
             try:
-                os.remove(temp_input_path)
+                candidates.append(BsonObjectId(cleaned))
             except Exception:
                 pass
+        return candidates
+
+    db_query = {
+        "task_id": {"$in": build_id_candidates_local(task_id)},
+        "project_id": {"$in": build_id_candidates_local(project_id)}
+    }
+    docs = list(audio_datapoints_collection.find(db_query).limit(10))
+    # Build a JSON-serializable view of the query
+    safe_query = {
+        "task_id": {"$in": [str(v) for v in build_id_candidates_local(task_id)]},
+        "project_id": {"$in": [str(v) for v in build_id_candidates_local(project_id)]},
+    }
+    return {
+        "db": MONGODB_DB,
+        "collection": "audioDatapoints",
+        "query": safe_query,
+        "count": len(docs),
+        "sample": [
+            {
+                "_id": str(d.get("_id")),
+                "has_mediaUrl": bool(d.get("mediaUrl")),
+                "task_id_type": type(d.get("task_id")).__name__,
+                "project_id_type": type(d.get("project_id")).__name__,
+            }
+            for d in docs
+        ],
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
