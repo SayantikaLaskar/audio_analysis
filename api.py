@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from pymongo import MongoClient
+from datetime import datetime
 
 app = FastAPI(title="Audio Processing API", version="1.0.0")
 
@@ -200,14 +201,46 @@ async def transcribe_json(request: TranscribeRequest):
             save_to_file=False,
         )
 
-        # Attach IDs
-        data["project_id"] = request.project_id
-        data["task_id"] = request.task_id
-        data["user_id"] = request.user_id
-        data["datapoint_id"] = str(dp.get("_id")) if dp.get("_id") else None
-        data["audio_url"] = audio_url
+        # Persist results back to audioDatapoints with pluralized fields
+        transcripts = data.get("transcript", [])
+        sound_effects = data.get("sound_effects", [])
 
-        return JSONResponse(content=data)
+        try:
+            if audio_datapoints_collection is not None and dp.get("_id") is not None:
+                audio_datapoints_collection.update_one(
+                    {"_id": dp["_id"]},
+                    {
+                        "$set": {
+                            "transcripts": transcripts,
+                            "soundEffects": sound_effects,
+                            "processingStatus": "completed",
+                            "updatedAt": datetime.utcnow(),
+                        },
+                        "$setOnInsert": {
+                            "project_id": dp.get("project_id", request.project_id),
+                            "task_id": dp.get("task_id", request.task_id),
+                            "createdAt": datetime.utcnow(),
+                        },
+                    },
+                    upsert=False,
+                )
+        except Exception as e:
+            # Do not fail the request if DB write fails; return processing result instead
+            print(f"Failed to write transcripts/soundEffects to MongoDB: {e}")
+
+        # API response with pluralized keys and IDs
+        response = {
+            "project_id": request.project_id,
+            "task_id": request.task_id,
+            "user_id": request.user_id,
+            "datapoint_id": str(dp.get("_id")) if dp.get("_id") else None,
+            "audio_url": audio_url,
+            "detected_language": data.get("detected_language"),
+            "transcripts": transcripts,
+            "soundEffects": sound_effects,
+        }
+
+        return JSONResponse(content=response)
 
     except HTTPException:
         raise
