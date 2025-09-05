@@ -2,7 +2,6 @@ import os
 import tempfile
 import requests
 import re
-from typing import Optional
 from pydantic import BaseModel
 try:
     from bson import ObjectId as BsonObjectId 
@@ -14,34 +13,20 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from datetime import datetime
+from bson import ObjectId
 
 app = FastAPI(title="Audio Processing API", version="1.0.0")
 
 # Load env and setup Mongo
 load_dotenv()
-MONGODB_URI = os.getenv("MONGODB_URI")
-MONGODB_DB = os.getenv("MONGODB_DB", "AkaiDb0")  # Updated to match your DB name
-MONGODB_COLLECTION = os.getenv("MONGODB_COLLECTION", "transcriptions")
-mongo_client: Optional[MongoClient] = None
-mongo_collection = None
-audio_datapoints_collection = None
+# MongoDB connection
+MONGODB_URL = os.getenv('MONGODB_URI')
+if not MONGODB_URL:
+    raise ValueError("MONGO_URI environment variable is not set")
 
-if MONGODB_URI:
-    try:
-        mongo_client = MongoClient(MONGODB_URI)
-        mongo_collection = mongo_client[MONGODB_DB][MONGODB_COLLECTION]
-        # Audio datapoints collection where media URL is stored
-        audio_datapoints_collection = mongo_client[MONGODB_DB]["audioDatapoints"]
-    except Exception:
-        mongo_client = None
-        mongo_collection = None
-        audio_datapoints_collection = None
-
-
-@app.get("/health")
-async def health() -> dict:
-    return {"status": "ok"}
-
+client = MongoClient(MONGODB_URL)
+db = client["AkaiDb0"]
+datapoints_collection = db["audioDatapoints"]
 
 class TranscribeRequest(BaseModel):
     project_id: str
@@ -52,12 +37,13 @@ class TranscribeRequest(BaseModel):
 @app.post("/transcribe")
 async def transcribe_json(request: TranscribeRequest):
     """Transcribe and analyze audio using a JSON body.
-
-    Body parameters:
-    - project_id: string
-    - task_id: string  
-    - user_id: string
     """
+    try:
+        task_id = ObjectId(request.task_id)
+        project_id = ObjectId(request.project_id)
+        user_id = ObjectId(request.user_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid task_id or project_id")
 
     # Lazy import heavy pipeline to avoid import failures when server boots
     try:
@@ -70,58 +56,21 @@ async def transcribe_json(request: TranscribeRequest):
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to import pipeline: {e}")
-
-    # Resolve audio URL from audioDatapoints collection
-    if audio_datapoints_collection is None:
-        raise HTTPException(status_code=500, detail="Audio datapoints collection not available")
-
-    # Build filters that match either string IDs or ObjectId-stored IDs
-    def build_id_candidates(value: str):
-        # Trim whitespace/newlines from incoming IDs
-        cleaned = (value or "").strip()
-        candidates = [cleaned]
-        if BsonObjectId is not None:
-            try:
-                candidates.append(BsonObjectId(cleaned))
-            except Exception:
-                pass
-        return candidates
-
+    
     try:
         # Updated query to match your data structure
         query = {
-            "task_id": {"$in": build_id_candidates(request.task_id)},
-            "project_id": {"$in": build_id_candidates(request.project_id)},
-            "mediaUrl": {"$exists": True}
+            "task_id": task_id, 
+            "project_id": project_id,
+            "processingStatus": "created"
         }
-        dp_list = list(audio_datapoints_collection.find(query))
-        
-        # Debug info
-        print(f"Query: {query}")
-        print(f"Task ID candidates: {build_id_candidates(request.task_id)}")
-        print(f"Project ID candidates: {build_id_candidates(request.project_id)}")
-        print(f"Found {len(dp_list)} documents")
+        dp = datapoints_collection.find_one(query)
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Datapoint query failed: {e}")
 
-    if not dp_list:
-        # Try a broader search for debugging
-        try:
-            task_only = list(audio_datapoints_collection.find({"task_id": {"$in": build_id_candidates(request.task_id)}}).limit(5))
-            project_only = list(audio_datapoints_collection.find({"project_id": {"$in": build_id_candidates(request.project_id)}}).limit(5))
-            print(f"Task-only matches: {len(task_only)}")
-            print(f"Project-only matches: {len(project_only)}")
-        except Exception as e:
-            print(f"Debug query failed: {e}")
-            
-        raise HTTPException(
-            status_code=404, 
-            detail=f"No datapoint found for task_id={request.task_id}, project_id={request.project_id}. Check /debug/audioDatapoints endpoint for available data."
-        )
-
-    # Get the first matching document
-    dp = dp_list[0]
+    if not dp:
+        raise HTTPException(status_code=404, detail="No datapoint found for given task_id and project_id with status 'created'")
     audio_url = dp.get("mediaUrl")
     if not audio_url:
         raise HTTPException(status_code=404, detail="Datapoint has no media URL field")
@@ -206,24 +155,17 @@ async def transcribe_json(request: TranscribeRequest):
         sound_effects = data.get("sound_effects", [])
 
         try:
-            if audio_datapoints_collection is not None and dp.get("_id") is not None:
-                audio_datapoints_collection.update_one(
-                    {"_id": dp["_id"]},
-                    {
-                        "$set": {
-                            "transcripts": transcripts,
-                            "soundEffects": sound_effects,
-                            "processingStatus": "completed",
-                            "updatedAt": datetime.utcnow(),
-                        },
-                        "$setOnInsert": {
-                            "project_id": dp.get("project_id", request.project_id),
-                            "task_id": dp.get("task_id", request.task_id),
-                            "createdAt": datetime.utcnow(),
-                        },
+            datapoints_collection.update_one(
+                {"_id": dp["_id"]},
+                {
+                    "$set": {
+                        "transcript": transcripts,
+                        "soundEffect": sound_effects,
+                        "processingStatus": "pre-label",
+                        "updatedAt": datetime.utcnow(),
                     },
-                    upsert=False,
-                )
+                },
+            )
         except Exception as e:
             # Do not fail the request if DB write fails; return processing result instead
             print(f"Failed to write transcripts/soundEffects to MongoDB: {e}")
@@ -256,49 +198,6 @@ async def transcribe_json(request: TranscribeRequest):
                 os.remove(wav_path)
         except Exception:
             pass
-
-
-@app.get("/debug/audioDatapoints")
-async def debug_audio_datapoints(project_id: str, task_id: str):
-    """Debug helper: check visibility of datapoints by IDs and collection/DB wiring."""
-    if audio_datapoints_collection is None:
-        raise HTTPException(status_code=500, detail="Audio datapoints collection not available")
-
-    def build_id_candidates_local(value: str):
-        cleaned = (value or "").strip()
-        candidates = [cleaned]
-        if BsonObjectId is not None:
-            try:
-                candidates.append(BsonObjectId(cleaned))
-            except Exception:
-                pass
-        return candidates
-
-    db_query = {
-        "task_id": {"$in": build_id_candidates_local(task_id)},
-        "project_id": {"$in": build_id_candidates_local(project_id)}
-    }
-    docs = list(audio_datapoints_collection.find(db_query).limit(10))
-    # Build a JSON-serializable view of the query
-    safe_query = {
-        "task_id": {"$in": [str(v) for v in build_id_candidates_local(task_id)]},
-        "project_id": {"$in": [str(v) for v in build_id_candidates_local(project_id)]},
-    }
-    return {
-        "db": MONGODB_DB,
-        "collection": "audioDatapoints",
-        "query": safe_query,
-        "count": len(docs),
-        "sample": [
-            {
-                "_id": str(d.get("_id")),
-                "has_mediaUrl": bool(d.get("mediaUrl")),
-                "task_id_type": type(d.get("task_id")).__name__,
-                "project_id_type": type(d.get("project_id")).__name__,
-            }
-            for d in docs
-        ],
-    }
 
 
 if __name__ == "__main__":

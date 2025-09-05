@@ -4,7 +4,7 @@ This project provides a complete audio analysis pipeline and a simple web API:
 
 - Sound Event Detection (SED) → Non‑speech audio events
 - Speaker Diarization → Who spoke when
-- Speech‑to‑Text (STT) → Transcription via OpenAI Whisper
+- Speech‑to‑Text (STT) → Transcription via OpenAI Whisper API
 - Emotion Detection → Emotions inferred from text
 - FastAPI service → Upload or reference audio and get structured JSON back
 
@@ -13,16 +13,18 @@ Results can be returned via API and/or saved to a local JSON file.
 ---
 
 ## 🚀 Features
+
 - Converts input audio (MP3, WAV, FLAC, M4A) to a consistent format when needed
 - Runs SED with the `MIT/ast-finetuned-audioset-10-10-0.4593` model
 - Runs Speaker Diarization with `pyannote.audio` (requires HF token)
-- Transcribes speech with OpenAI Whisper (medium model by default)
+- Transcribes speech with OpenAI Whisper API
 - Detects emotions for each transcript segment
 - Exposes a `/transcribe` API endpoint and/or writes `final_output.json`
 
 ---
 
 ## 📂 Project Structure
+
 ```
 ├── sed_stt.py          # CLI pipeline (SED + Diarization + STT + Emotion)
 ├── api.py              # FastAPI server exposing /transcribe
@@ -33,6 +35,7 @@ Results can be returned via API and/or saved to a local JSON file.
 ---
 
 ## ⚙️ Prerequisites
+
 - Python 3.10+
 - FFmpeg installed and available on PATH
   - Windows: download from `https://ffmpeg.org/download.html`, extract, add `bin/` to PATH
@@ -43,22 +46,28 @@ Results can be returned via API and/or saved to a local JSON file.
 
 ## 🧪 Setup
 
-1) Create and activate a virtual environment
+1. Create and activate a virtual environment
+
 ```
 python -m venv venv
 venv\Scripts\activate        # Windows
 # source venv/bin/activate    # Linux/macOS
 ```
 
-2) Install dependencies
+2. Install dependencies
+
 ```
 pip install -r requirements.txt
 ```
 
-3) Environment variables (create a `.env` file in the project root)
+3. Environment variables (create a `.env` file in the project root)
+
 ```
 # Required for diarization
 HF_TOKEN=your_huggingface_read_token
+
+# Required for speech-to-text
+OPENAI_API_KEY=your_openai_api_key
 
 # Optional: persist API results to MongoDB
 MONGODB_URI=mongodb+srv://user:pass@cluster/db
@@ -67,7 +76,9 @@ MONGODB_COLLECTION=transcriptions
 ```
 
 Notes:
+
 - If `HF_TOKEN` is not set, diarization will be skipped (pipeline continues).
+- If `OPENAI_API_KEY` is not set, speech transcription will fail.
 - On Windows, if you encounter symlink warnings from Hugging Face, you can set:
   - `set HF_HUB_DISABLE_SYMLINKS_WARNING=1`
   - `set HF_HUB_DISABLE_SYMLINKS=1`
@@ -79,9 +90,11 @@ Notes:
 The CLI pipeline is defined in `sed_stt.py`. It reads the file specified by `AUDIO_FILE` at the top of the script (default: `ENDE001.mp3`).
 
 Steps:
+
 1. Place your audio file in the project directory
 2. Edit `AUDIO_FILE` in `sed_stt.py` to point to your file name
 3. Run:
+
 ```
 python sed_stt.py
 ```
@@ -93,16 +106,19 @@ Output: a `final_output.json` file will be created with transcript, speakers, em
 ## 🌐 Usage (FastAPI server)
 
 Start the server:
+
 ```
 python api.py
 ```
 
 Endpoints:
+
 - GET /health → `{ "status": "ok" }`
 - POST /transcribe → JSON body (project_id, task_id, user_id)
 - POST /transcribe-upload → multipart file upload or form path input
 
 JSON body for `POST /transcribe`:
+
 ```json
 {
   "project_id": "68aab18274ec11e465e4fb91",
@@ -112,11 +128,13 @@ JSON body for `POST /transcribe`:
 ```
 
 Examples (PowerShell):
+
 ```
 curl -Method Post -Uri http://localhost:8000/transcribe -Body '{"project_id":"68aab18274ec11e465e4fb91","task_id":"68b58059c70e58f9921dbdfb","user_id":"6857b9446800696c7aa3cdc1"}' -ContentType 'application/json'
 ```
 
 Using `curl` (Git Bash / Linux / macOS):
+
 ```
 curl -X POST http://localhost:8000/transcribe \
   -H "Content-Type: application/json" \
@@ -128,12 +146,14 @@ curl -X POST http://localhost:8000/transcribe \
 ```
 
 File upload variant (`POST /transcribe-upload`):
+
 ```
 curl -X POST http://localhost:8000/transcribe-upload \
   -F "file=@sample.mp3"
 ```
 
 Response (example):
+
 ```json
 {
   "file_id": "sample",
@@ -149,9 +169,7 @@ Response (example):
       "emotion_score": 0.92
     }
   ],
-  "sound_effects": [
-    { "label": "Music", "score": 0.87 }
-  ],
+  "sound_effects": [{ "label": "Music", "score": 0.87 }],
   "metadata": { "annotator": "system_auto" }
 }
 ```
@@ -161,16 +179,18 @@ If MongoDB is configured, the response will also include the inserted `_id` or a
 ---
 
 ## ⚙️ Models and runtime
-- Device selection is automatic: CUDA if available, else CPU
-- Whisper model: `medium` (configured in `sed_stt.py`)
+
+- Device selection is automatic: CUDA if available, else CPU (for SED and emotion models)
+- Whisper: OpenAI Whisper API (whisper-1 model)
 - SED model: `MIT/ast-finetuned-audioset-10-10-0.4593`
 - Diarization: `pyannote/speaker-diarization@2.1` (requires `HF_TOKEN`)
 
-Tip: GPU significantly accelerates Whisper and transformer inference.
+Tip: GPU significantly accelerates SED and emotion detection inference. Whisper API calls don't require local GPU.
 
 ---
 
 ## 📊 Output schema (summary)
+
 ```json
 {
   "file_id": "<basename>",
@@ -194,6 +214,7 @@ Tip: GPU significantly accelerates Whisper and transformer inference.
 ---
 
 ## 🛠️ Troubleshooting
+
 - Windows symlink warnings from Hugging Face:
   - `set HF_HUB_DISABLE_SYMLINKS_WARNING=1`
   - `set HF_HUB_DISABLE_SYMLINKS=1`
@@ -201,9 +222,9 @@ Tip: GPU significantly accelerates Whisper and transformer inference.
   - Ensure `ffmpeg` is on PATH; on Windows, verify `C:\ffmpeg\bin` or your install location is added
 - Diarization failing:
   - Ensure `HF_TOKEN` is set and has read access; without it, diarization is skipped
+- Speech transcription failing:
+  - Ensure `OPENAI_API_KEY` is set with valid OpenAI API access
 - Large model downloads/timeouts:
-  - Pre-download models or ensure a stable connection; consider smaller Whisper models if needed
+  - Pre-download models or ensure a stable connection for SED/emotion models
 
 ---
-
-

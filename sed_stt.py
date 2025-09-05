@@ -5,7 +5,7 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 import torch
 import librosa
-import whisper
+from openai import OpenAI
 from pyannote.audio import Pipeline
 from transformers import pipeline as hf_pipeline
 import subprocess, json
@@ -22,6 +22,10 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # Load environment variables
 load_dotenv()
 HF_TOKEN = os.getenv("HF_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Initialize OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ===================== HELPER =====================
 def check_ffmpeg():
@@ -153,28 +157,50 @@ def run_diarization(audio_path):
 
 # ===================== 3. SPEECH TO TEXT =====================
 def run_stt(audio_path):
-    """Speech to text with error handling"""
+    """Speech to text using OpenAI Whisper API with error handling"""
     try:
-        print("🗣️  Loading Whisper model...")
-        model = whisper.load_model("medium", device=DEVICE)
+        print("🗣️  Using OpenAI Whisper API...")
         
-        print("📝 Running speech transcription...")
-        transcription = model.transcribe(audio_path)
+        if not OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY not set in environment (.env)")
         
-        detected_lang = transcription["language"]
+        # Open the audio file
+        with open(audio_path, "rb") as audio_file:
+            print("📝 Running speech transcription via API...")
+            # Use the Whisper API with timestamps
+            transcription = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="verbose_json",
+                timestamp_granularities=["segment"]
+            )
+        
+        detected_lang = transcription.language
         segments = []
-        for seg in transcription["segments"]:
+        
+        # Parse segments from API response
+        if hasattr(transcription, 'segments') and transcription.segments:
+            for seg in transcription.segments:
+                segments.append({
+                    "start_time": seg.start,
+                    "end_time": seg.end,
+                    "text": seg.text,
+                    "confidence": getattr(seg, 'avg_logprob', None)
+                })
+        else:
+            # Fallback: create a single segment with the full text
             segments.append({
-                "start_time": seg["start"],
-                "end_time": seg["end"],
-                "text": seg["text"],
-                "confidence": seg.get("avg_logprob", None)
+                "start_time": 0.0,
+                "end_time": 0.0,  # We don't have duration info
+                "text": transcription.text,
+                "confidence": None
             })
         
         print(f"✅ STT completed. Language: {detected_lang}, Segments: {len(segments)}")
         return detected_lang, segments
     except Exception as e:
         print(f"❌ STT failed: {e}")
+        print("📋 Note: You need a valid OpenAI API key for Whisper API")
         return "unknown", []
 
 # ===================== 4. EMOTION DETECTION =====================
