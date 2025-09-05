@@ -1,5 +1,6 @@
 
 import os
+import platform
 os.environ["PATH"] += os.pathsep + r"C:\ffmpeg\bin"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
@@ -11,14 +12,31 @@ import subprocess, json
 from pathlib import Path
 import shutil
 from dotenv import load_dotenv
+import torch
 
 
 # ===================== CONFIG =====================
 AUDIO_FILE = "ENDE001.mp3"
 OUTPUT_JSON = "final_output.json"
-# Force CPU usage for EC2 deployment (comment out for local GPU testing)
-DEVICE = "cpu"  # Explicitly set to CPU for EC2
-# DEVICE = "cuda" if torch.cuda.is_available() else "cpu"  # Uncomment for auto-detection
+
+# Auto-detect device with GPU support for AWS EC2, Mac, and Windows
+def get_optimal_device():
+    """Detect the best available device for computation"""
+    if torch.cuda.is_available():
+        # NVIDIA GPU available (AWS EC2 with GPU instances, Windows, Linux)
+        device = "cuda"
+        print(f"🚀 Using NVIDIA GPU: {torch.cuda.get_device_name(0)}")
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        # Apple Silicon GPU (Mac M1/M2/M3)
+        device = "mps"
+        print("🍎 Using Apple Metal Performance Shaders (MPS)")
+    else:
+        # Fallback to CPU
+        device = "cpu"
+        print("💻 Using CPU (no GPU detected)")
+    return device
+
+DEVICE = get_optimal_device()
 
 
 # Load environment variables
@@ -102,10 +120,15 @@ def run_sed(audio_path, threshold=0.01):
     """Sound Event Detection with error handling"""
     try:
         print("🔊 Loading SED model...")
+        
+        # Convert device string to device index for transformers pipeline
+        device_idx = 0 if DEVICE in ["cuda", "mps"] else -1
+        
         sed_pipeline = hf_pipeline(
             task="audio-classification",
             model="MIT/ast-finetuned-audioset-10-10-0.4593",
-            device=-1  # Force CPU usage
+            device=device_idx,
+            torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32
         )
         
         print("🎵 Loading audio for SED...")
@@ -133,10 +156,18 @@ def run_diarization(audio_path):
         print("👥 Loading diarization model...")
         if not HF_TOKEN:
             raise RuntimeError("HF_TOKEN not set in environment (.env)")
+        
+        # Set device for pyannote pipeline
+        device = torch.device(DEVICE)
+        
         pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization@2.1",
             use_auth_token=HF_TOKEN
         )
+        
+        # Move pipeline to the appropriate device
+        if DEVICE != "cpu":
+            pipeline = pipeline.to(device)
         
         print("🎯 Running speaker diarization...")
         diarization = pipeline(audio_path)
@@ -213,11 +244,16 @@ def run_emotion_detection(texts):
     
     try:
         print("😊 Loading emotion detection model...")
+        
+        # Convert device string to device index for transformers pipeline
+        device_idx = 0 if DEVICE in ["cuda", "mps"] else -1
+        
         emo_pipeline = hf_pipeline(
             "text-classification",
             model="j-hartmann/emotion-english-distilroberta-base",
             top_k=None,
-            device=-1  # Force CPU usage
+            device=device_idx,
+            torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32
         )
         
         print("🎭 Running emotion detection...")
@@ -305,6 +341,16 @@ if __name__ == "__main__":
     print(f"📁 Working directory: {os.getcwd()}")
     print(f"🎵 Input file: {AUDIO_FILE}")
     print(f"💻 Using device: {DEVICE}")
+    print(f"🖥️  Platform: {platform.system()} {platform.machine()}")
+    
+    # Set optimizations for different platforms
+    if DEVICE == "cuda":
+        torch.backends.cudnn.benchmark = True
+        print("⚡ CUDA optimizations enabled")
+    elif DEVICE == "mps":
+        print("🍎 MPS optimizations enabled")
+        # Set memory fraction for Apple Silicon
+        os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
     
     # Check if input file exists
     if not check_file_exists(AUDIO_FILE):
@@ -317,9 +363,18 @@ if __name__ == "__main__":
 
         print("\n🔊 Running Sound Event Detection...")
         sed_events = run_sed(wav_path)
+        
+        # Clear GPU cache if using GPU
+        if DEVICE in ["cuda", "mps"]:
+            torch.cuda.empty_cache() if DEVICE == "cuda" else None
+            print("🗑️  GPU cache cleared")
 
         print("\n👥 Running Speaker Diarization...")
         diarization = run_diarization(wav_path)
+        
+        # Clear GPU cache again
+        if DEVICE in ["cuda", "mps"]:
+            torch.cuda.empty_cache() if DEVICE == "cuda" else None
 
         print("\n🗣️  Running Speech-to-Text...")
         detected_lang, transcript = run_stt(wav_path)
@@ -332,9 +387,17 @@ if __name__ == "__main__":
             os.remove(wav_path)
             print(f"🧹 Cleaned up temporary file: {wav_path}")
             
+        # Final GPU cleanup
+        if DEVICE in ["cuda", "mps"]:
+            torch.cuda.empty_cache() if DEVICE == "cuda" else None
+            print("🗑️  Final GPU cleanup completed")
+            
         print("\n🎉 Processing completed successfully!")
         
     except Exception as e:
         print(f"\n❌ Fatal error: {e}")
         print("📋 Please check your dependencies and file paths")
+        # Clean up GPU memory on error
+        if DEVICE in ["cuda", "mps"]:
+            torch.cuda.empty_cache() if DEVICE == "cuda" else None
         exit(1)
