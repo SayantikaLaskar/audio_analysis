@@ -17,7 +17,10 @@ from dotenv import load_dotenv
 # ===================== CONFIG =====================
 AUDIO_FILE = "ENDE001.mp3"
 OUTPUT_JSON = "final_output.json"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# Force CPU usage for EC2 deployment (comment out for local GPU testing)
+DEVICE = "cpu"  # Explicitly set to CPU for EC2
+# DEVICE = "cuda" if torch.cuda.is_available() else "cpu"  # Uncomment for auto-detection
+
 
 # Load environment variables
 load_dotenv()
@@ -103,7 +106,7 @@ def run_sed(audio_path, threshold=0.01):
         sed_pipeline = hf_pipeline(
             task="audio-classification",
             model="MIT/ast-finetuned-audioset-10-10-0.4593",
-            device=0 if DEVICE == "cuda" else -1
+            device=-1  # Force CPU usage
         )
         
         print("🎵 Loading audio for SED...")
@@ -215,7 +218,7 @@ def run_emotion_detection(texts):
             "text-classification",
             model="j-hartmann/emotion-english-distilroberta-base",
             top_k=None,
-            device=0 if DEVICE == "cuda" else -1
+            device=-1  # Force CPU usage
         )
         
         print("🎭 Running emotion detection...")
