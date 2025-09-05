@@ -3,7 +3,6 @@ import os
 os.environ["PATH"] += os.pathsep + r"C:\ffmpeg\bin"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
-import torch
 import librosa
 from openai import OpenAI
 from pyannote.audio import Pipeline
