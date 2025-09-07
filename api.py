@@ -19,7 +19,6 @@ app = FastAPI(title="Audio Processing API", version="1.0.0")
 
 # Load env and setup Mongo
 load_dotenv()
-# MongoDB connection
 MONGODB_URL = os.getenv('MONGODB_URI')
 if not MONGODB_URL:
     raise ValueError("MONGO_URI environment variable is not set")
@@ -36,8 +35,6 @@ class TranscribeRequest(BaseModel):
 
 @app.post("/transcribe")
 async def transcribe_json(request: TranscribeRequest):
-    """Transcribe and analyze audio using a JSON body.
-    """
     try:
         task_id = ObjectId(request.task_id)
         project_id = ObjectId(request.project_id)
@@ -45,7 +42,7 @@ async def transcribe_json(request: TranscribeRequest):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid task_id or project_id")
 
-    # Lazy import heavy pipeline to avoid import failures when server boots
+    # Lazy import heavy pipeline
     try:
         from sed_stt import (
             convert_to_wav,
@@ -53,12 +50,12 @@ async def transcribe_json(request: TranscribeRequest):
             run_diarization,
             run_stt,
             build_output,
+            load_waveform  # === MODIFIED ===
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to import pipeline: {e}")
     
     try:
-        # Updated query to match your data structure
         query = {
             "task_id": task_id, 
             "project_id": project_id,
@@ -75,7 +72,6 @@ async def transcribe_json(request: TranscribeRequest):
     if not audio_url:
         raise HTTPException(status_code=404, detail="Datapoint has no media URL field")
 
-    # Download audio to a temporary file (supports public HTTP and private S3 via boto3)
     temp_file = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".audio") as tf:
@@ -84,7 +80,7 @@ async def transcribe_json(request: TranscribeRequest):
             if r.status_code == 200:
                 tf.write(r.content)
             else:
-                # Try S3 signed download if URL looks like S3 and boto3 credentials exist
+                # Handle S3 download if needed
                 is_s3 = bool(re.match(r"^https?://[\w.-]*s3[\w.-]*/", audio_url)) or audio_url.startswith("s3://")
                 if is_s3:
                     try:
@@ -93,17 +89,14 @@ async def transcribe_json(request: TranscribeRequest):
 
                         def parse_s3(url: str):
                             if url.startswith("s3://"):
-                                # s3://bucket/key
                                 parts = url[5:].split("/", 1)
                                 return parts[0], parts[1]
-                            # https://bucket.s3.amazonaws.com/key or virtual-hosted-style
                             parsed = urlparse(url)
                             host = parsed.netloc
                             path = parsed.path.lstrip("/")
                             if ".s3" in host:
                                 bucket = host.split(".s3")[0]
                             else:
-                                # path-style: s3.amazonaws.com/bucket/key
                                 first, rest = path.split("/", 1)
                                 bucket, path = first, rest
                             return bucket, path
@@ -134,12 +127,16 @@ async def transcribe_json(request: TranscribeRequest):
         # Convert or use original
         wav_path = convert_to_wav(temp_file)
 
-        # Run pipeline
-        sed_events = run_sed(wav_path)
-        diarization = run_diarization(wav_path)
+        # === MODIFIED: load waveform once for reuse ===
+        waveform, sr = load_waveform(wav_path)  # waveform = np.array, sr = sample rate
+
+        # === MODIFIED: pass waveform and sr to models instead of path ===
+        sed_events = run_sed(waveform, sr)
+        diarization = run_diarization(waveform, sr)
+
+        # Whisper API still requires path
         detected_lang, transcript = run_stt(wav_path)
 
-        # Build output dict (do not write to local file)
         data = build_output(
             str(dp.get("_id")) if dp.get("_id") else "datapoint",
             audio_url,
@@ -150,7 +147,6 @@ async def transcribe_json(request: TranscribeRequest):
             save_to_file=False,
         )
 
-        # Persist results back to audioDatapoints with pluralized fields
         transcripts = data.get("transcript", [])
         sound_effects = data.get("sound_effects", [])
 
@@ -167,10 +163,8 @@ async def transcribe_json(request: TranscribeRequest):
                 },
             )
         except Exception as e:
-            # Do not fail the request if DB write fails; return processing result instead
             print(f"Failed to write transcripts/soundEffects to MongoDB: {e}")
 
-        # API response with pluralized keys and IDs
         response = {
             "project_id": request.project_id,
             "task_id": request.task_id,
@@ -189,11 +183,9 @@ async def transcribe_json(request: TranscribeRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # Cleanup temporary file
         try:
             if temp_file and os.path.exists(temp_file):
                 os.remove(temp_file)
-            # Also cleanup wav file if it's different from temp_file
             if 'wav_path' in locals() and wav_path != temp_file and os.path.exists(wav_path):
                 os.remove(wav_path)
         except Exception:
