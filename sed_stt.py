@@ -4,6 +4,7 @@ os.environ["PATH"] += os.pathsep + r"C:\ffmpeg\bin"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 import librosa
+from openai import OpenAI
 from transformers import pipeline as hf_pipeline, AutoFeatureExtractor, AutoModelForAudioClassification
 import subprocess, json
 from pathlib import Path
@@ -12,7 +13,6 @@ from dotenv import load_dotenv
 import torch
 import numpy as np
 from sklearn.cluster import KMeans
-from faster_whisper import WhisperModel
 
 
 # ===================== CONFIG =====================
@@ -26,6 +26,10 @@ print("💻 Forcing CPU-only execution (GPU disabled by request)")
 # Load environment variables
 load_dotenv()
 HF_TOKEN = os.getenv("HF_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Initialize OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ===================== HELPER =====================
 def check_ffmpeg():
@@ -173,18 +177,30 @@ def run_diarization(waveform, sr):
 # ===================== 3. SPEECH TO TEXT =====================
 # Remains unchanged; still uses audio file for Whisper API
 def run_stt(audio_path):
-    """Speech-to-text using local faster-whisper with the tiny model on CPU."""
     try:
-        model = WhisperModel("tiny", device="cpu", compute_type="int8")
-        segments_iter, info = model.transcribe(audio_path, vad_filter=True, vad_parameters={"min_silence_duration_ms": 300})
-        detected_lang = getattr(info, "language", "unknown") or "unknown"
+        with open(audio_path, "rb") as audio_file:
+            transcription = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="verbose_json",
+                timestamp_granularities=["segment"]
+            )
+        detected_lang = transcription.language
         segments = []
-        for seg in segments_iter:
+        if hasattr(transcription, 'segments') and transcription.segments:
+            for seg in transcription.segments:
+                segments.append({
+                    "start_time": seg.start,
+                    "end_time": seg.end,
+                    "text": seg.text,
+                    "confidence": getattr(seg, 'avg_logprob', None)
+                })
+        else:
             segments.append({
-                "start_time": float(seg.start),
-                "end_time": float(seg.end),
-                "text": seg.text,
-                "confidence": float(seg.avg_logprob) if hasattr(seg, "avg_logprob") and seg.avg_logprob is not None else None
+                "start_time": 0.0,
+                "end_time": 0.0,
+                "text": transcription.text,
+                "confidence": None
             })
         return detected_lang, segments
     except Exception as e:
