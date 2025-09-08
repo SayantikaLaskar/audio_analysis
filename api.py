@@ -57,9 +57,8 @@ async def transcribe_json(request: TranscribeRequest):
     
     try:
         query = {
-            "task_id": task_id, 
+            "task_id": task_id,
             "project_id": project_id,
-            "processingStatus": "created"
         }
         dp = datapoints_collection.find_one(query)
         

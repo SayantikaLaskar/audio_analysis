@@ -4,42 +4,28 @@ os.environ["PATH"] += os.pathsep + r"C:\ffmpeg\bin"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 import librosa
-from openai import OpenAI
-from pyannote.audio import Inference
 from transformers import pipeline as hf_pipeline, AutoFeatureExtractor, AutoModelForAudioClassification
 import subprocess, json
 from pathlib import Path
 import shutil
 from dotenv import load_dotenv
 import torch
+import numpy as np
+from sklearn.cluster import KMeans
+from faster_whisper import WhisperModel
 
 
 # ===================== CONFIG =====================
 AUDIO_FILE = "ENDE001.mp3"
 OUTPUT_JSON = "final_output.json"
 
-# Auto-detect device with GPU support for AWS EC2, Mac, and Windows
-def get_optimal_device():
-    if torch.cuda.is_available():
-        device = "cuda"
-        print(f"🚀 Using NVIDIA GPU: {torch.cuda.get_device_name(0)}")
-    # elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-    #     device = "mps"
-    #     print("🍎 Using Apple Metal Performance Shaders (MPS)")
-    else:
-        device = "cpu"
-        print("💻 Using CPU (no GPU detected)")
-    return device
-
-DEVICE = get_optimal_device()
+# Force CPU-only execution regardless of GPU availability
+DEVICE = "cpu"
+print("💻 Forcing CPU-only execution (GPU disabled by request)")
 
 # Load environment variables
 load_dotenv()
 HF_TOKEN = os.getenv("HF_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# Initialize OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ===================== HELPER =====================
 def check_ffmpeg():
@@ -88,15 +74,13 @@ def run_sed(waveform, sr, threshold=0.01):  # === MODIFIED ===
     """Sound Event Detection with error handling"""
     try:
         print("🔊 Loading SED model...")
-        device_idx = 0 if DEVICE in ["cuda", "mps"] else -1
+        device_idx = -1
         
         # === MODIFIED: Use feature extractor to process waveform once ===
         extractor = AutoFeatureExtractor.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
         model = AutoModelForAudioClassification.from_pretrained("MIT/ast-finetuned-audioset-10-10-0.4593")
         inputs = extractor(waveform, sampling_rate=sr, return_tensors="pt")
-        if DEVICE == "cuda":
-            model.to("cuda")
-            inputs = {k: v.to("cuda") for k,v in inputs.items()}
+        # CPU only
         
         with torch.no_grad():
             outputs = model(**inputs)
@@ -116,67 +100,91 @@ def run_sed(waveform, sr, threshold=0.01):  # === MODIFIED ===
 
 # ===================== 2. SPEAKER DIARIZATION =====================
 def run_diarization(waveform, sr):
-    """Speaker activity segmentation using pyannote/segmentation"""
+    """Fast CPU-only diarization via simple VAD + MFCC k-means clustering.
+
+    Produces segments with speaker labels S1/S2. Falls back to single speaker S1.
+    """
     try:
-        if not HF_TOKEN:
-            raise RuntimeError("HF_TOKEN not set")
+        # 1) Simple VAD using short-time energy
+        frame_length = int(0.03 * sr)  # 30ms
+        hop_length = int(0.015 * sr)   # 15ms
+        if frame_length <= 0:
+            frame_length = 512
+        if hop_length <= 0:
+            hop_length = 256
+        frames = librosa.util.frame(waveform, frame_length=frame_length, hop_length=hop_length)
+        energy = np.mean(frames**2, axis=0)
+        thresh = np.percentile(energy, 75)
+        voiced = energy > max(thresh, 1e-8)
 
-        # Load segmentation model as Inference
-        inference = Inference("pyannote/segmentation", use_auth_token=HF_TOKEN, device=DEVICE)
-
-        # waveform must be (time,) or (1, time)
-        waveform_tensor = torch.tensor(waveform).unsqueeze(0)  # shape [1, time]
-        # Compute speech activity scores
-        speech_scores = inference(waveform_tensor, sample_rate=sr)
-
-        # Convert scores to speech segments
-        # Thresholding example
-        threshold = 0.5
+        # 2) Build contiguous voiced segments
         segments = []
-        start = None
-        for i, score in enumerate(speech_scores[0]):  # assuming batch=1
-            t = i / sr
-            if score >= threshold and start is None:
-                start = t
-            elif score < threshold and start is not None:
-                segments.append({"start": start, "end": t, "speaker": "unknown"})
-                start = None
-        if start is not None:
-            segments.append({"start": start, "end": len(waveform)/sr, "speaker": "unknown"})
+        start_idx = None
+        for i, v in enumerate(voiced):
+            if v and start_idx is None:
+                start_idx = i
+            elif not v and start_idx is not None:
+                s = start_idx * hop_length / sr
+                e = (i * hop_length + frame_length) / sr
+                if e - s > 0.2:
+                    segments.append({"start": s, "end": e})
+                start_idx = None
+        if start_idx is not None:
+            s = start_idx * hop_length / sr
+            e = (len(voiced) * hop_length + frame_length) / sr
+            if e - s > 0.2:
+                segments.append({"start": s, "end": e})
 
-        print(f"✅ Segmentation detected {len(segments)} segments")
-        return segments
+        if not segments:
+            return []
+
+        # 3) Extract MFCC embeddings per segment
+        embeddings = []
+        for seg in segments:
+            s = int(seg["start"] * sr)
+            e = int(seg["end"] * sr)
+            clip = waveform[s:e]
+            if len(clip) < int(0.2 * sr):
+                # pad short clips
+                pad = int(0.2 * sr) - len(clip)
+                clip = np.pad(clip, (0, pad))
+            mfcc = librosa.feature.mfcc(y=clip, sr=sr, n_mfcc=20)
+            emb = np.mean(mfcc, axis=1)
+            embeddings.append(emb)
+        embeddings = np.stack(embeddings, axis=0)
+
+        # 4) KMeans into up to 2 speakers if enough segments, else 1
+        num_segments = embeddings.shape[0]
+        n_clusters = 2 if num_segments >= 2 else 1
+        km = KMeans(n_clusters=n_clusters, n_init=10, random_state=0)
+        labels = km.fit_predict(embeddings)
+
+        diarized = []
+        for seg, lab in zip(segments, labels):
+            speaker = f"S{int(lab)+1}"
+            diarized.append({"start": seg["start"], "end": seg["end"], "speaker": speaker})
+
+        print(f"✅ Diarization produced {len(diarized)} segments across {n_clusters} speaker(s) on CPU")
+        return diarized
     except Exception as e:
-        print(f"❌ Segmentation failed: {e}")
+        print(f"❌ Diarization failed: {e}")
         return []
 
 # ===================== 3. SPEECH TO TEXT =====================
 # Remains unchanged; still uses audio file for Whisper API
 def run_stt(audio_path):
+    """Speech-to-text using local faster-whisper with the tiny model on CPU."""
     try:
-        with open(audio_path, "rb") as audio_file:
-            transcription = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                response_format="verbose_json",
-                timestamp_granularities=["segment"]
-            )
-        detected_lang = transcription.language
+        model = WhisperModel("tiny", device="cpu", compute_type="int8")
+        segments_iter, info = model.transcribe(audio_path, vad_filter=True, vad_parameters={"min_silence_duration_ms": 300})
+        detected_lang = getattr(info, "language", "unknown") or "unknown"
         segments = []
-        if hasattr(transcription, 'segments') and transcription.segments:
-            for seg in transcription.segments:
-                segments.append({
-                    "start_time": seg.start,
-                    "end_time": seg.end,
-                    "text": seg.text,
-                    "confidence": getattr(seg, 'avg_logprob', None)
-                })
-        else:
+        for seg in segments_iter:
             segments.append({
-                "start_time": 0.0,
-                "end_time": 0.0,
-                "text": transcription.text,
-                "confidence": None
+                "start_time": float(seg.start),
+                "end_time": float(seg.end),
+                "text": seg.text,
+                "confidence": float(seg.avg_logprob) if hasattr(seg, "avg_logprob") and seg.avg_logprob is not None else None
             })
         return detected_lang, segments
     except Exception as e:
@@ -212,7 +220,7 @@ def run_emotion_detection(texts):
 # Remains unchanged
 def build_output(file_id, audio_path, sed_events, diarization, transcript, detected_lang, save_to_file=True):
     for t in transcript:
-        t["speaker"] = "Unknown"
+        t["speaker"] = "S1"
         for s in diarization:
             if (s["start"] <= t["start_time"] <= s["end"]) or (s["start"] <= t["end_time"] <= s["end"]):
                 t["speaker"] = s["speaker"]
