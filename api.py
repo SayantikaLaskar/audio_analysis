@@ -32,7 +32,6 @@ class TranscribeRequest(BaseModel):
     task_id: str
     user_id: str
 
-
 @app.post("/transcribe")
 async def transcribe_json(request: TranscribeRequest):
     try:
@@ -42,15 +41,12 @@ async def transcribe_json(request: TranscribeRequest):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid task_id or project_id")
 
-    # Lazy import heavy pipeline
+    # Lazy import updated pipeline
     try:
         from sed_stt import (
             convert_to_wav,
-            run_sed,
-            run_diarization,
-            run_stt,
-            build_output,
-            load_waveform  # === MODIFIED ===
+            run_assemblyai_transcription,
+            build_output
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to import pipeline: {e}")
@@ -68,6 +64,7 @@ async def transcribe_json(request: TranscribeRequest):
 
     if not dp:
         raise HTTPException(status_code=404, detail="No datapoint found for given task_id and project_id with status 'created'")
+    
     audio_url = dp.get("mediaUrl")
     if not audio_url:
         raise HTTPException(status_code=404, detail="Datapoint has no media URL field")
@@ -127,24 +124,17 @@ async def transcribe_json(request: TranscribeRequest):
         # Convert or use original
         wav_path = convert_to_wav(temp_file)
 
-        # === MODIFIED: load waveform once for reuse ===
-        waveform, sr = load_waveform(wav_path)  # waveform = np.array, sr = sample rate
+        # Use AssemblyAI for everything: transcription, diarization, and sentiment
+        detected_lang, segments, diarization, language_confidence = run_assemblyai_transcription(wav_path)
 
-        # === MODIFIED: pass waveform and sr to models instead of path ===
-        sed_events = run_sed(waveform, sr)
-        diarization = run_diarization(waveform, sr)
-
-        # Whisper API still requires path
-        detected_lang, transcript = run_stt(wav_path)
-
+        # Build output (sound effects will be empty since we removed SED)
         data = build_output(
             str(dp.get("_id")) if dp.get("_id") else "datapoint",
             audio_url,
-            sed_events,
+            segments,
             diarization,
-            transcript,
             detected_lang,
-            save_to_file=False,
+            language_confidence,
         )
 
         transcripts = data.get("transcript", [])
@@ -190,7 +180,6 @@ async def transcribe_json(request: TranscribeRequest):
                 os.remove(wav_path)
         except Exception:
             pass
-
 
 if __name__ == "__main__":
     import uvicorn
